@@ -1,0 +1,2389 @@
+--[[
+    DEV G SCRIPTS — 100% Fail-Safe Loader GUI for ALL executors.
+]]
+
+-- ===================== SERVICES =====================
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local lp = Players.LocalPlayer
+
+-- Optional services (safely fetched)
+local TweenService
+pcall(function() TweenService = game:GetService("TweenService") end)
+
+local VirtualUser
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
+
+-- Async Packets fetch (non-blocking)
+local Packets
+task.spawn(function()
+    pcall(function()
+        local pkg = RS:WaitForChild("Packages", 3)
+        if pkg then Packets = require(pkg:WaitForChild("Packets", 3)) end
+    end)
+end)
+
+-- ===================== ANTI-AFK (ALWAYS ON) =====================
+pcall(function()
+    if lp then
+        lp.Idled:Connect(function()
+            pcall(function()
+                if VirtualUser then
+                    VirtualUser:CaptureController()
+                    VirtualUser:ClickButton2(Vector2.new(0, 0))
+                end
+            end)
+        end)
+    end
+end)
+
+-- ===================== DESTROY OLD INSTANCE =====================
+if _G.DEVG_DESTROY then
+    pcall(_G.DEVG_DESTROY)
+end
+
+-- ===================== STATE & PERSISTENCE =====================
+local driveOn, noclipOn, rollBuyOn, bossOn, moneyFarmOn = false, false, false, false, false
+local rollOn, autoBuyOn = false, false
+local moneyFarmArrived = false -- true when car reached Stage_5/Batch_58/Part center and is frozen
+local customSpeed = 100
+local serverTop, lastDbg, lastRespawnTry = nil, 0, 0
+local rollN, buyN = 0, 0
+local straightDir = nil
+local connections = {}
+local orbitAngle = 0
+local currentBoss = nil
+local bossAutoDisabledDrive = false -- track if we auto-disabled drive/noclip for this boss encounter
+
+-- Keybind settings
+local minimizeKeybind = Enum.KeyCode.RightControl
+local listeningForKey = false
+
+-- Rarity system & colors (verified: Common, Uncommon, Rare, Epic, Legendary, Mythic, Secret, Divine)
+local rarityNames = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Secret", "Divine"}
+local rarityColors = {
+    Common    = Color3.fromRGB(180, 180, 180),
+    Uncommon  = Color3.fromRGB(80, 200, 120),
+    Rare      = Color3.fromRGB(60, 150, 255),
+    Epic      = Color3.fromRGB(170, 70, 240),
+    Legendary = Color3.fromRGB(255, 170, 0),
+    Mythic    = Color3.fromRGB(255, 50, 90),
+    Mythical  = Color3.fromRGB(255, 50, 90),
+    Secret    = Color3.fromRGB(0, 240, 255),
+    Divine    = Color3.fromRGB(255, 230, 100),
+}
+local rarityOrder = {}
+for i, name in ipairs(rarityNames) do rarityOrder[string.lower(name)] = i end
+rarityOrder["mythical"] = rarityOrder["mythic"] -- Synonym mapping
+local minRarityIdx = 3
+
+-- Blacklist state
+local useBlacklist = false
+local blacklistText = ""
+local selectedBlacklistItems = {} -- table of lowercase item names
+
+-- CONFIG FILE SYSTEM
+local CONFIG_FILE = "dev_g_config.json"
+
+local function saveConfig()
+    pcall(function()
+        if writefile then
+            local blackList = {}
+            for item, active in pairs(selectedBlacklistItems) do
+                if active then table.insert(blackList, item) end
+            end
+            local data = {
+                driveOn = driveOn,
+                noclipOn = noclipOn,
+                rollBuyOn = rollBuyOn,
+                bossOn = bossOn,
+                moneyFarmOn = moneyFarmOn,
+                customSpeed = customSpeed,
+                minRarityIdx = minRarityIdx,
+                useBlacklist = useBlacklist,
+                blacklistText = blacklistText,
+                selectedBlacklistItems = blackList,
+                minimizeKeybind = minimizeKeybind and minimizeKeybind.Name or "RightControl"
+            }
+            writefile(CONFIG_FILE, HttpService:JSONEncode(data))
+        end
+    end)
+end
+
+local function loadConfig()
+    pcall(function()
+        if readfile and (isfile and isfile(CONFIG_FILE)) then
+            local content = readfile(CONFIG_FILE)
+            if content and content ~= "" then
+                local data = HttpService:JSONDecode(content)
+                if data then
+                    if type(data.driveOn) == "boolean" then driveOn = data.driveOn end
+                    if type(data.noclipOn) == "boolean" then noclipOn = data.noclipOn end
+                    if type(data.rollBuyOn) == "boolean" then
+                        rollBuyOn = data.rollBuyOn
+                        rollOn = rollBuyOn
+                        autoBuyOn = rollBuyOn
+                    end
+                    if type(data.bossOn) == "boolean" then bossOn = data.bossOn end
+                    if type(data.moneyFarmOn) == "boolean" then moneyFarmOn = data.moneyFarmOn end
+                    if type(data.customSpeed) == "number" then customSpeed = data.customSpeed end
+                    if type(data.minRarityIdx) == "number" then minRarityIdx = math.clamp(data.minRarityIdx, 1, #rarityNames) end
+                    if type(data.useBlacklist) == "boolean" then useBlacklist = data.useBlacklist end
+                    if type(data.blacklistText) == "string" then blacklistText = data.blacklistText end
+                    if type(data.selectedBlacklistItems) == "table" then
+                        selectedBlacklistItems = {}
+                        for _, item in ipairs(data.selectedBlacklistItems) do
+                            selectedBlacklistItems[string.lower(tostring(item))] = true
+                        end
+                    end
+                    if type(data.minimizeKeybind) == "string" and Enum.KeyCode[data.minimizeKeybind] then
+                        minimizeKeybind = Enum.KeyCode[data.minimizeKeybind]
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- Load configuration on launch
+loadConfig()
+
+-- Console item log entries (ONLY bought items)
+local logs = {}
+local updateConsoleUI = nil
+
+local function addLog(msg, tag)
+    tag = tag or "BUY"
+    local timestamp = "00:00:00"
+    pcall(function()
+        if os and os.date then
+            timestamp = os.date("%H:%M:%S")
+        end
+    end)
+    local entry = string.format("[%s] [%s] %s", timestamp, tag, tostring(msg))
+    table.insert(logs, entry)
+    if #logs > 100 then table.remove(logs, 1) end
+    if updateConsoleUI then pcall(updateConsoleUI) end
+end
+
+-- ===================== UTILITY FUNCTIONS =====================
+local function getCar()
+    local cars = workspace:FindFirstChild("Cars")
+    if not cars or not lp then return nil end
+    for _, c in ipairs(cars:GetChildren()) do
+        if c:IsA("Model") and c:GetAttribute("OwnerUserId") == lp.UserId then return c end
+    end
+    return nil
+end
+
+local function myPlot()
+    local g = workspace:FindFirstChild("Game")
+    local plots = g and g:FindFirstChild("Lobby") and g.Lobby:FindFirstChild("Plots")
+    if not plots or not lp then return nil end
+    for _, p in ipairs(plots:GetChildren()) do
+        if p:IsA("Model") then
+            local ownerId = p:GetAttribute("OwnerUserId") or p:GetAttribute("Owner") or p:GetAttribute("UserId")
+            if ownerId == lp.UserId or tostring(ownerId) == tostring(lp.UserId) then return p end
+        end
+    end
+    for _, p in ipairs(plots:GetChildren()) do
+        if p:IsA("Model") and p:FindFirstChild("Rolls") then return p end
+    end
+    return nil
+end
+
+local function returnToLobby()
+    task.spawn(function()
+        pcall(function()
+            local plot = myPlot()
+            if not plot then return end
+            -- Find a suitable spawn position in the plot
+            local targetPos = nil
+            if plot.PrimaryPart then
+                targetPos = plot.PrimaryPart.Position + Vector3.new(0, 5, 0)
+            else
+                for _, p in ipairs(plot:GetDescendants()) do
+                    if p:IsA("BasePart") then
+                        targetPos = p.Position + Vector3.new(0, 5, 0)
+                        break
+                    end
+                end
+            end
+            if not targetPos then return end
+
+            local car = getCar()
+            if car and car.PrimaryPart then
+                car.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
+                car.PrimaryPart.AssemblyAngularVelocity = Vector3.zero
+                car.PrimaryPart.CFrame = CFrame.new(targetPos)
+            end
+            if lp and lp.Character and lp.Character:FindFirstChild("HumanoidRootPart") then
+                lp.Character.HumanoidRootPart.CFrame = CFrame.new(targetPos)
+            end
+        end)
+    end)
+end
+
+local function detectRarityInItemPlace()
+    local plot = myPlot()
+    if not plot then return nil, nil end
+    local rolls = plot:FindFirstChild("Rolls")
+    if not rolls then return nil, nil end
+    for _, rollFolder in ipairs({"RollWeapons", "RollBlocks"}) do
+        local rf = rolls:FindFirstChild(rollFolder)
+        if rf then
+            local info = rf:FindFirstChild("Info") or (rf:FindFirstChild("Roll") and rf.Roll:FindFirstChild("Info"))
+            local rarityLabel = info and info:FindFirstChild("Rarity")
+            if rarityLabel and rarityLabel:IsA("TextLabel") and rarityLabel.Text ~= "" and rarityLabel.Text ~= "???" then
+                local txt = string.lower(rarityLabel.Text)
+                for i, rName in ipairs(rarityNames) do
+                    if string.find(txt, string.lower(rName)) then return i, rName end
+                end
+            end
+            local ip = rf:FindFirstChild("ItemPlace")
+            if ip then
+                for _, child in ipairs(ip:GetChildren()) do
+                    local itemRarity = child:GetAttribute("Rarity") or child:GetAttribute("ItemRarity")
+                    if itemRarity then
+                        local txt = string.lower(tostring(itemRarity))
+                        for i, rName in ipairs(rarityNames) do
+                            if string.find(txt, string.lower(rName)) then return i, rName end
+                        end
+                    end
+                    for _, desc in ipairs(child:GetDescendants()) do
+                        if desc:IsA("TextLabel") and desc.Text ~= "" and desc.Text ~= "???" then
+                            local txt = string.lower(desc.Text)
+                            for i, rName in ipairs(rarityNames) do
+                                if string.find(txt, string.lower(rName)) then return i, rName end
+                            end
+                        end
+                    end
+                end
+            end
+            for _, desc in ipairs(rf:GetDescendants()) do
+                if desc:IsA("TextLabel") and desc.Text ~= "" and desc.Text ~= "???" and desc.Name ~= "Chance" and desc.Name ~= "Price" and desc.Name ~= "Count" then
+                    local txt = string.lower(desc.Text)
+                    for i, rName in ipairs(rarityNames) do
+                        if string.find(txt, string.lower(rName)) then return i, rName end
+                    end
+                end
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function safeTween(obj, tweenInfo, props)
+    if TweenService then
+        pcall(function() TweenService:Create(obj, tweenInfo, props):Play() end)
+    else
+        pcall(function() for k, v in pairs(props) do obj[k] = v end end)
+    end
+end
+
+local function safeCorner(parent, radius)
+    pcall(function()
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, radius)
+        c.Parent = parent
+    end)
+end
+
+local function safeStroke(parent, color, thickness, transparency)
+    pcall(function()
+        local s = Instance.new("UIStroke")
+        s.Color = color
+        s.Thickness = thickness or 1
+        s.Transparency = transparency or 0
+        s.Parent = parent
+    end)
+end
+
+-- ===================== GUI CREATION =====================
+local gui = Instance.new("ScreenGui")
+gui.Name = "DevGScripts"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local parented = false
+pcall(function()
+    if gethui then
+        gui.Parent = gethui()
+        parented = true
+    end
+end)
+if not parented then
+    pcall(function()
+        gui.Parent = game:GetService("CoreGui")
+        parented = true
+    end)
+end
+if not parented and lp then
+    pcall(function()
+        gui.Parent = lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 3)
+        parented = true
+    end)
+end
+
+-- Color palette (Dark Slate / Loader Theme with Violet Accents)
+local C = {
+    bg          = Color3.fromRGB(18, 19, 24),
+    sidebar     = Color3.fromRGB(24, 25, 32),
+    contentBg   = Color3.fromRGB(14, 15, 20),
+    card        = Color3.fromRGB(28, 30, 40),
+    cardHover   = Color3.fromRGB(36, 38, 50),
+    accent      = Color3.fromRGB(138, 43, 226),
+    accentHover = Color3.fromRGB(158, 63, 246),
+    accentLt    = Color3.fromRGB(180, 110, 255),
+    border      = Color3.fromRGB(42, 45, 58),
+    borderLight = Color3.fromRGB(60, 65, 82),
+    textMain    = Color3.fromRGB(235, 238, 245),
+    textDim     = Color3.fromRGB(140, 145, 165),
+    textOff     = Color3.fromRGB(90, 95, 115),
+    red         = Color3.fromRGB(235, 65, 75),
+    green       = Color3.fromRGB(40, 200, 110),
+    orange      = Color3.fromRGB(250, 160, 25),
+}
+
+-- Notification container
+local notifyContainer = Instance.new("Frame")
+notifyContainer.Name = "Notifs"
+notifyContainer.Size = UDim2.new(0, 320, 1, -20)
+notifyContainer.Position = UDim2.new(1, -330, 0, 10)
+notifyContainer.BackgroundTransparency = 1
+notifyContainer.Parent = gui
+
+pcall(function()
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 8)
+    layout.VerticalAlignment = Enum.VerticalAlignment.Top
+    layout.Parent = notifyContainer
+end)
+
+local function notify(text, isWarning)
+    task.spawn(function()
+        if not gui or not gui.Parent then return end
+
+        local card = Instance.new("Frame")
+        card.Size = UDim2.new(1, 0, 0, 42)
+        card.BackgroundColor3 = isWarning and Color3.fromRGB(35, 25, 15) or C.card
+        card.BorderSizePixel = 0
+        card.ClipsDescendants = true
+        card.Parent = notifyContainer
+        safeCorner(card, 6)
+        safeStroke(card, isWarning and C.orange or C.border, 1, 0.4)
+
+        local accentBar = Instance.new("Frame")
+        accentBar.Size = UDim2.new(0, 4, 1, 0)
+        accentBar.BackgroundColor3 = isWarning and C.orange or C.accent
+        accentBar.BorderSizePixel = 0
+        accentBar.Parent = card
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -16, 1, 0)
+        label.Position = UDim2.new(0, 12, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = isWarning and Color3.fromRGB(255, 200, 120) or C.textMain
+        label.Font = Enum.Font.GothamMedium
+        label.TextSize = 13
+        label.TextWrapped = true
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = card
+
+        local bar = Instance.new("Frame")
+        bar.Size = UDim2.new(1, 0, 0, 3)
+        bar.Position = UDim2.new(0, 0, 1, -3)
+        bar.BackgroundColor3 = isWarning and C.orange or C.accentLt
+        bar.BorderSizePixel = 0
+        bar.Parent = card
+
+        safeTween(bar, TweenInfo and TweenInfo.new(3.0, Enum.EasingStyle.Linear) or nil, {Size = UDim2.new(0, 0, 0, 3)})
+        task.wait(3.0)
+        safeTween(card, TweenInfo and TweenInfo.new(0.3) or nil, {BackgroundTransparency = 1})
+        safeTween(label, TweenInfo and TweenInfo.new(0.3) or nil, {TextTransparency = 1})
+        task.wait(0.35)
+        pcall(function() card:Destroy() end)
+    end)
+end
+
+-- ===================== MINIMIZED FLOATING DRAGGABLE ICON =====================
+local minWidget = Instance.new("Frame")
+minWidget.Name = "DevGMinWidget"
+minWidget.Size = UDim2.new(0, 115, 0, 38)
+minWidget.Position = UDim2.new(0, 20, 0.5, -19)
+minWidget.BackgroundColor3 = C.sidebar
+minWidget.BorderSizePixel = 0
+minWidget.Active = true
+minWidget.Draggable = true
+minWidget.Visible = false
+minWidget.Parent = gui
+safeCorner(minWidget, 8)
+safeStroke(minWidget, C.accent, 1.5, 0.3)
+
+local minWidgetIcon = Instance.new("TextLabel")
+minWidgetIcon.Size = UDim2.new(0, 26, 1, 0)
+minWidgetIcon.Position = UDim2.new(0, 8, 0, 0)
+minWidgetIcon.BackgroundTransparency = 1
+minWidgetIcon.Text = "❖"
+minWidgetIcon.TextColor3 = C.accent
+minWidgetIcon.Font = Enum.Font.GothamBold
+minWidgetIcon.TextSize = 16
+minWidgetIcon.Parent = minWidget
+
+local minWidgetText = Instance.new("TextLabel")
+minWidgetText.Size = UDim2.new(1, -38, 1, 0)
+minWidgetText.Position = UDim2.new(0, 34, 0, 0)
+minWidgetText.BackgroundTransparency = 1
+minWidgetText.Text = "DEV G"
+minWidgetText.TextColor3 = C.textMain
+minWidgetText.Font = Enum.Font.GothamBold
+minWidgetText.TextSize = 13
+minWidgetText.TextXAlignment = Enum.TextXAlignment.Left
+minWidgetText.Parent = minWidget
+
+local minWidgetClicker = Instance.new("TextButton")
+minWidgetClicker.Size = UDim2.new(1, 0, 1, 0)
+minWidgetClicker.BackgroundTransparency = 1
+minWidgetClicker.Text = ""
+minWidgetClicker.Parent = minWidget
+
+-- ===================== MAIN WINDOW (660 x 400 ENLARGED) =====================
+local main = Instance.new("Frame")
+main.Name = "DevGMain"
+main.Size = UDim2.new(0, 660, 0, 400)
+main.Position = UDim2.new(0.5, -330, 0.5, -200)
+main.BackgroundColor3 = C.bg
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+safeCorner(main, 8)
+safeStroke(main, C.border, 1, 0)
+
+-- ===================== HEADER BAR =====================
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 42)
+header.BackgroundColor3 = C.sidebar
+header.BorderSizePixel = 0
+header.Parent = main
+safeCorner(header, 8)
+
+local headerPatch = Instance.new("Frame")
+headerPatch.Size = UDim2.new(1, 0, 0, 12)
+headerPatch.Position = UDim2.new(0, 0, 1, -12)
+headerPatch.BackgroundColor3 = C.sidebar
+headerPatch.BorderSizePixel = 0
+headerPatch.Parent = header
+
+local headerSep = Instance.new("Frame")
+headerSep.Size = UDim2.new(1, 0, 0, 1)
+headerSep.Position = UDim2.new(0, 0, 1, 0)
+headerSep.BackgroundColor3 = C.border
+headerSep.BorderSizePixel = 0
+headerSep.Parent = header
+
+local titleIcon = Instance.new("TextLabel")
+titleIcon.Size = UDim2.new(0, 28, 1, 0)
+titleIcon.Position = UDim2.new(0, 12, 0, 0)
+titleIcon.BackgroundTransparency = 1
+titleIcon.Text = "❖"
+titleIcon.TextColor3 = C.accent
+titleIcon.Font = Enum.Font.GothamBold
+titleIcon.TextSize = 16
+titleIcon.Parent = header
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(0, 160, 1, 0)
+titleLabel.Position = UDim2.new(0, 38, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "DEV G SCRIPTS"
+titleLabel.TextColor3 = C.textMain
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 15
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = header
+
+local versionBadge = Instance.new("TextLabel")
+versionBadge.Size = UDim2.new(0, 90, 0, 22)
+versionBadge.Position = UDim2.new(0, 198, 0.5, -11)
+versionBadge.BackgroundColor3 = Color3.fromRGB(35, 25, 55)
+versionBadge.TextColor3 = C.accentLt
+versionBadge.Font = Enum.Font.GothamBold
+versionBadge.TextSize = 10
+versionBadge.Text = "v2.7 • LOADER"
+versionBadge.BorderSizePixel = 0
+versionBadge.Parent = header
+safeCorner(versionBadge, 4)
+safeStroke(versionBadge, C.accent, 1, 0.5)
+
+-- Window Controls
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 30, 0, 24)
+closeBtn.Position = UDim2.new(1, -36, 0.5, -12)
+closeBtn.BackgroundColor3 = Color3.fromRGB(45, 25, 30)
+closeBtn.TextColor3 = C.red
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.Text = "✕"
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = header
+safeCorner(closeBtn, 4)
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.new(0, 30, 0, 24)
+minBtn.Position = UDim2.new(1, -72, 0.5, -12)
+minBtn.BackgroundColor3 = Color3.fromRGB(30, 32, 42)
+minBtn.TextColor3 = C.textDim
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 14
+minBtn.Text = "—"
+minBtn.BorderSizePixel = 0
+minBtn.Parent = header
+safeCorner(minBtn, 4)
+
+-- ===================== BODY CONTAINER =====================
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.new(1, 0, 1, -43)
+body.Position = UDim2.new(0, 0, 0, 43)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+-- ===================== LEFT SIDEBAR (170px WIDE) =====================
+local sidebar = Instance.new("Frame")
+sidebar.Name = "Sidebar"
+sidebar.Size = UDim2.new(0, 170, 1, -32)
+sidebar.Position = UDim2.new(0, 0, 0, 0)
+sidebar.BackgroundColor3 = C.sidebar
+sidebar.BorderSizePixel = 0
+sidebar.Parent = body
+
+local sidebarRightBorder = Instance.new("Frame")
+sidebarRightBorder.Size = UDim2.new(0, 1, 1, 0)
+sidebarRightBorder.Position = UDim2.new(1, -1, 0, 0)
+sidebarRightBorder.BackgroundColor3 = C.border
+sidebarRightBorder.BorderSizePixel = 0
+sidebarRightBorder.Parent = sidebar
+
+local tabList = Instance.new("Frame")
+tabList.Size = UDim2.new(1, -14, 1, -12)
+tabList.Position = UDim2.new(0, 7, 0, 6)
+tabList.BackgroundTransparency = 1
+tabList.Parent = sidebar
+
+pcall(function()
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 5)
+    layout.Parent = tabList
+end)
+
+-- ===================== RIGHT CONTENT AREA =====================
+local contentArea = Instance.new("Frame")
+contentArea.Name = "ContentArea"
+contentArea.Size = UDim2.new(1, -170, 1, -32)
+contentArea.Position = UDim2.new(0, 170, 0, 0)
+contentArea.BackgroundColor3 = C.contentBg
+contentArea.BorderSizePixel = 0
+contentArea.Parent = body
+
+-- ===================== FOOTER / ACTION BAR =====================
+local footer = Instance.new("Frame")
+footer.Name = "Footer"
+footer.Size = UDim2.new(1, 0, 0, 32)
+footer.Position = UDim2.new(0, 0, 1, -32)
+footer.BackgroundColor3 = C.sidebar
+footer.BorderSizePixel = 0
+footer.Parent = body
+
+local footerTopBorder = Instance.new("Frame")
+footerTopBorder.Size = UDim2.new(1, 0, 0, 1)
+footerTopBorder.Position = UDim2.new(0, 0, 0, 0)
+footerTopBorder.BackgroundColor3 = C.border
+footerTopBorder.BorderSizePixel = 0
+footerTopBorder.Parent = footer
+
+local footerStatus = Instance.new("TextLabel")
+footerStatus.Size = UDim2.new(1, -180, 1, 0)
+footerStatus.Position = UDim2.new(0, 12, 0, 0)
+footerStatus.BackgroundTransparency = 1
+footerStatus.Text = "STATUS: Idle | Anti-AFK: ALWAYS ON"
+footerStatus.TextColor3 = C.textDim
+footerStatus.Font = Enum.Font.Gotham
+footerStatus.TextSize = 11
+footerStatus.TextXAlignment = Enum.TextXAlignment.Left
+footerStatus.Parent = footer
+
+local unloadBtn = Instance.new("TextButton")
+unloadBtn.Size = UDim2.new(0, 110, 0, 22)
+unloadBtn.Position = UDim2.new(1, -120, 0.5, -11)
+unloadBtn.BackgroundColor3 = Color3.fromRGB(45, 20, 25)
+unloadBtn.TextColor3 = C.red
+unloadBtn.Font = Enum.Font.GothamBold
+unloadBtn.TextSize = 11
+unloadBtn.Text = "UNLOAD SCRIPT"
+unloadBtn.BorderSizePixel = 0
+unloadBtn.Parent = footer
+safeCorner(unloadBtn, 4)
+safeStroke(unloadBtn, C.red, 1, 0.6)
+
+-- ===================== TAB SYSTEM =====================
+local tabs = {}
+local currentTab = nil
+
+local function selectTab(name)
+    for tabName, t in pairs(tabs) do
+        if tabName == name then
+            t.page.Visible = true
+            t.bar.Visible = true
+            t.btn.BackgroundColor3 = C.card
+            t.icon.TextColor3 = C.accentLt
+            t.title.TextColor3 = C.textMain
+            currentTab = name
+        else
+            t.page.Visible = false
+            t.bar.Visible = false
+            t.btn.BackgroundColor3 = C.sidebar
+            t.icon.TextColor3 = C.textDim
+            t.title.TextColor3 = C.textDim
+        end
+    end
+end
+
+local function createTab(name, icon, order)
+    local tabBtn = Instance.new("TextButton")
+    tabBtn.Size = UDim2.new(1, 0, 0, 36)
+    tabBtn.BackgroundColor3 = C.sidebar
+    tabBtn.BorderSizePixel = 0
+    tabBtn.Text = ""
+    tabBtn.LayoutOrder = order
+    tabBtn.Parent = tabList
+    safeCorner(tabBtn, 5)
+
+    local activeBar = Instance.new("Frame")
+    activeBar.Size = UDim2.new(0, 4, 1, -10)
+    activeBar.Position = UDim2.new(0, 3, 0, 5)
+    activeBar.BackgroundColor3 = C.accent
+    activeBar.BorderSizePixel = 0
+    activeBar.Visible = false
+    activeBar.Parent = tabBtn
+
+    local iconLabel = Instance.new("TextLabel")
+    iconLabel.Size = UDim2.new(0, 28, 1, 0)
+    iconLabel.Position = UDim2.new(0, 10, 0, 0)
+    iconLabel.BackgroundTransparency = 1
+    iconLabel.Text = icon
+    iconLabel.TextColor3 = C.textDim
+    iconLabel.Font = Enum.Font.GothamBold
+    iconLabel.TextSize = 15
+    iconLabel.Parent = tabBtn
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Size = UDim2.new(1, -42, 1, 0)
+    titleLbl.Position = UDim2.new(0, 38, 0, 0)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Text = name
+    titleLbl.TextColor3 = C.textDim
+    titleLbl.Font = Enum.Font.GothamMedium
+    titleLbl.TextSize = 13
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.Parent = tabBtn
+
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, -24, 1, -24)
+    page.Position = UDim2.new(0, 12, 0, 12)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.ScrollBarImageColor3 = C.border
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Visible = false
+    page.Parent = contentArea
+
+    pcall(function()
+        local layout = Instance.new("UIListLayout")
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Padding = UDim.new(0, 10)
+        layout.Parent = page
+    end)
+
+    local tabData = {
+        btn = tabBtn,
+        page = page,
+        bar = activeBar,
+        icon = iconLabel,
+        title = titleLbl
+    }
+
+    tabBtn.MouseButton1Click:Connect(function()
+        selectTab(name)
+    end)
+
+    tabs[name] = tabData
+    return page
+end
+
+-- Create Tabs
+local mainPage    = createTab("Overview", "⚡", 1)
+local drivePage   = createTab("Auto Drive", "🚗", 2)
+local rollBuyPage = createTab("Auto Roll & Buy", "🎲", 3)
+local bossPage    = createTab("Event Boss", "👾", 4)
+local moneyPage   = createTab("Money Farm", "💰", 5)
+local settingsPage= createTab("Settings", "⚙️", 6)
+local logPage     = createTab("Console Log", "💻", 7)
+
+-- Select Overview tab safely
+selectTab("Overview")
+
+-- ===================== UI HELPER COMPONENTS =====================
+
+local function addToggleRow(parent, labelText, defaultState, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 40)
+    frame.BackgroundColor3 = C.card
+    frame.BorderSizePixel = 0
+    frame.Parent = parent
+    safeCorner(frame, 5)
+    safeStroke(frame, C.border, 1, 0.4)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -70, 1, 0)
+    lbl.Position = UDim2.new(0, 12, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelText
+    lbl.TextColor3 = C.textMain
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = frame
+
+    local pillBg = Instance.new("TextButton")
+    pillBg.Size = UDim2.new(0, 42, 0, 22)
+    pillBg.Position = UDim2.new(1, -54, 0.5, -11)
+    pillBg.BackgroundColor3 = C.border
+    pillBg.Text = ""
+    pillBg.BorderSizePixel = 0
+    pillBg.Parent = frame
+    safeCorner(pillBg, 11)
+
+    local pillDot = Instance.new("Frame")
+    pillDot.Size = UDim2.new(0, 16, 0, 16)
+    pillDot.Position = UDim2.new(0, 3, 0.5, -8)
+    pillDot.BackgroundColor3 = Color3.new(1, 1, 1)
+    pillDot.BorderSizePixel = 0
+    pillDot.Parent = pillBg
+    safeCorner(pillDot, 8)
+
+    local state = defaultState or false
+
+    local function updateVisual()
+        if state then
+            pillBg.BackgroundColor3 = C.accent
+            pillDot.Position = UDim2.new(1, -19, 0.5, -8)
+            frame.BackgroundColor3 = Color3.fromRGB(24, 20, 36)
+        else
+            pillBg.BackgroundColor3 = C.border
+            pillDot.Position = UDim2.new(0, 3, 0.5, -8)
+            frame.BackgroundColor3 = C.card
+        end
+    end
+
+    local function toggle()
+        state = not state
+        updateVisual()
+        if callback then callback(state) end
+        saveConfig()
+        return state
+    end
+
+    pillBg.MouseButton1Click:Connect(toggle)
+    updateVisual()
+
+    return {
+        getState = function() return state end,
+        setState = function(v) state = v; updateVisual() end,
+        toggle = toggle
+    }
+end
+
+local function addSectionHeader(parent, text)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 22)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = string.upper(text)
+    lbl.TextColor3 = C.accentLt
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = parent
+end
+
+-- Forward declarations for cross-toggle synchronization
+local ovDrive, ovNoclip, ovRollBuy, ovBoss, ovMoneyFarm
+local driveMainToggle, noclipMainToggle, rollBuyMainToggle, bossMainToggle, moneyFarmMainToggle
+
+-- ===================== TAB 1: OVERVIEW PAGE =====================
+addSectionHeader(mainPage, "Quick Engine Status")
+
+local statusCard = Instance.new("Frame")
+statusCard.Size = UDim2.new(1, 0, 0, 105)
+statusCard.BackgroundColor3 = C.card
+statusCard.BorderSizePixel = 0
+statusCard.Parent = mainPage
+safeCorner(statusCard, 5)
+safeStroke(statusCard, C.border, 1, 0.4)
+
+local statusGrid = Instance.new("Frame")
+statusGrid.Size = UDim2.new(1, -20, 1, -18)
+statusGrid.Position = UDim2.new(0, 10, 0, 9)
+statusGrid.BackgroundTransparency = 1
+statusGrid.Parent = statusCard
+
+pcall(function()
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0.48, 0, 0, 40)
+    grid.CellPadding = UDim2.new(0.04, 0, 0, 8)
+    grid.Parent = statusGrid
+end)
+
+local function makeStatItem(title, initialVal)
+    local f = Instance.new("Frame")
+    f.BackgroundColor3 = C.sidebar
+    f.BorderSizePixel = 0
+    f.Parent = statusGrid
+    safeCorner(f, 4)
+
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -12, 0, 16)
+    t.Position = UDim2.new(0, 6, 0, 4)
+    t.BackgroundTransparency = 1
+    t.Text = title
+    t.TextColor3 = C.textOff
+    t.Font = Enum.Font.Gotham
+    t.TextSize = 10
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.Parent = f
+
+    local v = Instance.new("TextLabel")
+    v.Size = UDim2.new(1, -12, 0, 18)
+    v.Position = UDim2.new(0, 6, 0, 18)
+    v.BackgroundTransparency = 1
+    v.Text = initialVal
+    v.TextColor3 = C.textMain
+    v.Font = Enum.Font.GothamBold
+    v.TextSize = 13
+    v.TextXAlignment = Enum.TextXAlignment.Left
+    v.Parent = f
+
+    return v
+end
+
+local statCash = makeStatItem("PLAYER CASH", "Checking...")
+local statRolls = makeStatItem("TOTAL ROLLS", "0")
+local statBuys = makeStatItem("ITEMS BOUGHT", "0")
+local statAfk = makeStatItem("ANTI-AFK STATUS", "ACTIVE (Always)")
+
+addSectionHeader(mainPage, "Quick Toggles")
+
+ovDrive = addToggleRow(mainPage, "Auto Drive [Speed 100-300]", driveOn, function(s)
+    driveOn = s
+    noclipOn = s
+    if ovNoclip then ovNoclip.setState(s) end
+    if noclipMainToggle then noclipMainToggle.setState(s) end
+    if driveMainToggle then driveMainToggle.setState(s) end
+    notify("Auto Drive: " .. (s and "ON (Auto Noclip ON)" or "OFF"), false)
+end)
+
+ovNoclip = addToggleRow(mainPage, "Noclip Engine", noclipOn, function(s)
+    noclipOn = s
+    if noclipMainToggle then noclipMainToggle.setState(s) end
+    notify("Noclip: " .. (s and "ON" or "OFF"), false)
+end)
+
+ovRollBuy = addToggleRow(mainPage, "Auto Roll & Buy", rollBuyOn, function(s)
+    rollBuyOn = s
+    rollOn = s
+    autoBuyOn = s
+    if rollBuyMainToggle then rollBuyMainToggle.setState(s) end
+    notify("Auto Roll & Buy: " .. (s and "ON" or "OFF"), false)
+end)
+
+ovBoss = addToggleRow(mainPage, "Event Boss Joiner & Orbit", bossOn, function(s)
+    bossOn = s
+    if bossMainToggle then bossMainToggle.setState(s) end
+    notify("Event Boss Engine: " .. (s and "ON" or "OFF"), false)
+end)
+
+ovMoneyFarm = addToggleRow(mainPage, "Money Farm", moneyFarmOn, function(s)
+    moneyFarmOn = s
+    if not s then
+        moneyFarmArrived = false
+        returnToLobby()
+    end
+    if moneyFarmMainToggle then moneyFarmMainToggle.setState(s) end
+    notify("Money Farm: " .. (s and "ON — Driving to Stage 5 (Batch_58)" or "OFF — Returning to Lobby"), false)
+end)
+
+-- ===================== TAB 2: AUTO DRIVE PAGE =====================
+addSectionHeader(drivePage, "Auto-Drive Control")
+
+driveMainToggle = addToggleRow(drivePage, "Enable Auto Drive", driveOn, function(s)
+    driveOn = s
+    noclipOn = s
+    if ovDrive then ovDrive.setState(s) end
+    if ovNoclip then ovNoclip.setState(s) end
+    if noclipMainToggle then noclipMainToggle.setState(s) end
+    notify("Auto Drive: " .. (s and "ON (Auto Noclip ON)" or "OFF"), false)
+end)
+
+addSectionHeader(drivePage, "Target Speed Presets")
+
+local speedFrame = Instance.new("Frame")
+speedFrame.Size = UDim2.new(1, 0, 0, 46)
+speedFrame.BackgroundColor3 = C.card
+speedFrame.BorderSizePixel = 0
+speedFrame.Parent = drivePage
+safeCorner(speedFrame, 5)
+safeStroke(speedFrame, C.border, 1, 0.4)
+
+local speedBtns = {}
+local speeds = {100, 200, 300}
+local btnW = math.floor((440 - 24) / 4)
+
+for idx, sp in ipairs(speeds) do
+    local sb = Instance.new("TextButton")
+    sb.Size = UDim2.new(0, btnW, 0, 30)
+    sb.Position = UDim2.new(0, 10 + (idx - 1) * (btnW + 6), 0.5, -15)
+    sb.BackgroundColor3 = (sp == customSpeed) and C.accent or C.sidebar
+    sb.TextColor3 = (sp == customSpeed) and Color3.new(1,1,1) or C.textDim
+    sb.Font = Enum.Font.GothamBold
+    sb.TextSize = 12
+    sb.Text = tostring(sp)
+    sb.BorderSizePixel = 0
+    sb.Parent = speedFrame
+    safeCorner(sb, 4)
+    speedBtns[sp] = sb
+end
+
+local speedBox = Instance.new("TextBox")
+speedBox.Size = UDim2.new(0, btnW, 0, 30)
+speedBox.Position = UDim2.new(0, 10 + 3 * (btnW + 6), 0.5, -15)
+speedBox.BackgroundColor3 = C.sidebar
+speedBox.TextColor3 = Color3.new(1, 1, 1)
+speedBox.PlaceholderText = "Custom..."
+speedBox.PlaceholderColor3 = C.textOff
+speedBox.Text = tostring(customSpeed)
+speedBox.Font = Enum.Font.GothamBold
+speedBox.TextSize = 12
+speedBox.BorderSizePixel = 0
+speedBox.ClearTextOnFocus = true
+speedBox.Parent = speedFrame
+safeCorner(speedBox, 4)
+
+local function updateSpeedUI(sel)
+    customSpeed = sel
+    speedBox.Text = tostring(sel)
+    for sp, sb in pairs(speedBtns) do
+        sb.BackgroundColor3 = (sp == sel) and C.accent or C.sidebar
+        sb.TextColor3 = (sp == sel) and Color3.new(1,1,1) or C.textDim
+    end
+    saveConfig()
+end
+
+for sp, sb in pairs(speedBtns) do
+    sb.MouseButton1Click:Connect(function()
+        updateSpeedUI(sp)
+        notify("Target Speed set to " .. tostring(sp), false)
+    end)
+end
+
+speedBox.FocusLost:Connect(function()
+    local val = tonumber(speedBox.Text)
+    if val then
+        val = math.clamp(val, 10, 1000)
+        updateSpeedUI(val)
+        notify("Target Speed set to " .. tostring(val), false)
+    else
+        speedBox.Text = tostring(customSpeed)
+    end
+end)
+
+addSectionHeader(drivePage, "Collision Controls")
+
+noclipMainToggle = addToggleRow(drivePage, "Vehicle & Player Noclip", noclipOn, function(s)
+    noclipOn = s
+    if ovNoclip then ovNoclip.setState(s) end
+    notify("Noclip: " .. (s and "ON" or "OFF"), false)
+end)
+
+-- ===================== TAB 3: AUTO ROLL & BUY PAGE =====================
+addSectionHeader(rollBuyPage, "Auto Roll & Buy Main Toggle")
+
+rollBuyMainToggle = addToggleRow(rollBuyPage, "Enable Auto Roll & Stand Scanner", rollBuyOn, function(s)
+    rollBuyOn = s
+    rollOn = s
+    autoBuyOn = s
+    if ovRollBuy then ovRollBuy.setState(s) end
+    notify("Auto Roll & Buy: " .. (s and "ON" or "OFF"), false)
+end)
+
+addSectionHeader(rollBuyPage, "Minimum Rarity Filter")
+
+local rarityBtn = Instance.new("TextButton")
+rarityBtn.Size = UDim2.new(1, 0, 0, 36)
+rarityBtn.BackgroundColor3 = C.card
+rarityBtn.TextColor3 = C.accentLt
+rarityBtn.Font = Enum.Font.GothamBold
+rarityBtn.TextSize = 12
+rarityBtn.Text = "MINIMUM RARITY:  " .. rarityNames[minRarityIdx] .. "+"
+rarityBtn.BorderSizePixel = 0
+rarityBtn.Parent = rollBuyPage
+safeCorner(rarityBtn, 5)
+safeStroke(rarityBtn, C.border, 1, 0.4)
+
+rarityBtn.MouseButton1Click:Connect(function()
+    minRarityIdx = (minRarityIdx % #rarityNames) + 1
+    rarityBtn.Text = "MINIMUM RARITY:  " .. rarityNames[minRarityIdx] .. "+"
+    notify("Min rarity filter set to: " .. rarityNames[minRarityIdx] .. "+", false)
+    saveConfig()
+end)
+
+
+addSectionHeader(rollBuyPage, "Item Blacklist — Click Items to Skip")
+
+local blToggle = addToggleRow(rollBuyPage, "Enforce Blacklist System", useBlacklist, function(s)
+    useBlacklist = s
+    notify("Blacklist system: " .. (s and "ACTIVE (Will skip blacklisted items)" or "OFF"), false)
+end)
+
+-- Full item database organized by category
+local ITEM_DATABASE = {
+    {
+        category = "⚙️ ENGINES",
+        items = {
+            {name = "Small Engine",      rarity = "Common"},
+            {name = "Engine V2",         rarity = "Uncommon"},
+            {name = "Red-V3",            rarity = "Rare"},
+            {name = "Blue Monster",      rarity = "Epic"},
+            {name = "Flame Turbo-X",     rarity = "Legend"},
+            {name = "Scarlet X",         rarity = "Legend"},
+            {name = "Ivy Turbo X",       rarity = "Mythic"},
+            {name = "Cyber Liquid V",    rarity = "Mythic"},
+            {name = "Purple Twin-Turbo", rarity = "Secret"},
+            {name = "Toxic Engine",      rarity = "Secret"},
+        }
+    },
+    {
+        category = "⛽ FUELS",
+        items = {
+            {name = "Small Tank",  rarity = "Common"},
+            {name = "Dual Fuel",  rarity = "Uncommon"},
+            {name = "Pro Fuel",  rarity = "Rare"},
+            {name = "Fuel Barrel",  rarity = "Epic"},
+            {name = "Double arrels",  rarity = "Legend"},
+            {name = "Super Fuel",      rarity = "Legend"},
+            {name = "Navy Barrel",     rarity = "Mythic"},
+            {name = "Turbo Fuel",      rarity = "Mythic"},
+            {name = "Double Nitro",    rarity = "Secret"},
+        }
+    },
+    {
+        category = "☸ WHEELS",
+        items = {
+            {name = "Basic Wheel",   rarity = "Common"},
+            {name = "Rubber Wheel",  rarity = "Uncommon"},
+            {name = "Razor Wheel",   rarity = "Rare"},
+            {name = "Spiked Wheel",  rarity = "Legend"},
+            {name = "Titan Wheel",   rarity = "Mythic"},
+            {name = "Mammoth Wheel", rarity = "Secret"},
+        }
+    },
+    {
+        category = "🔫 SUPPORTS",
+        items = {
+            {name = "Wooden Spike",   rarity = "Common"},
+            {name = "Shredder",     rarity = "Uncommon"},
+            {name = "Metal Spike",     rarity = "Rare"},
+            {name = "Crossbow",     rarity = "Epic"},
+            {name = "Barrel Gun",     rarity = "Epic"},
+            {name = "Green Smasher",  rarity = "Epic"},
+            {name = "Roller Blade",   rarity = "Epic"},
+            {name = "Mini Missile",   rarity = "Legend"},
+            {name = "Double Barrel",  rarity = "Legend"},
+            {name = "Rocket Turbo",   rarity = "Mythic"},
+            {name = "Mounted Gun",    rarity = "Mythic"},
+            {name = "Quad Launcher",    rarity = "Mythic"},
+            {name = "Toxic Roller",    rarity = "Mythic"},
+            {name = "Robo Roller",  rarity = "Secret"},
+            {name = "Railgun",        rarity = "Secret"},
+            {name = "Toxic Speader",  rarity = "Secret"},
+        }
+    },
+    {
+        category = "🧱 BLOCKS",
+        items = {
+            {name = "Basic Block", rarity = "Common"},
+            {name = "Basic Slab", rarity = "Uncommon"},
+            {name = "Basic Cylinder", rarity = "Rare"},
+            {name = "Basic Wedge", rarity = "Epic"},
+            {name = "Glass Block", rarity = "Epic"},
+            {name = "Glass Slab", rarity = "Epic"},
+            {name = "Glass Cylinder", rarity = "Epic"},
+            {name = "Glass Wedge", rarity = "Epic"},
+            {name = "Driver Seat", rarity = "Common"},
+            {name = "Passenger Seat", rarity = "Uncommon"},
+            {name = "Headlight", rarity = "Uncommon"},
+            {name = "Carbon Fiber Wedge", rarity = "Rare"},
+            {name = "Carbon Fiber Block", rarity = "Rare"},
+            {name = "Carbon Fiber Slab", rarity = "Rare"},
+            {name = "Carbon Fiber Cylinder", rarity = "Rare"},
+            {name = "Side Mirror", rarity = "Rare"},
+            {name = "Sport Wing", rarity = "Rare"},
+            {name = "Pro Wing", rarity = "Epic"},
+            {name = "Hood Scoop", rarity = "Epic"},
+            {name = "Armored Block", rarity = "Epic"},
+            {name = "Armored Cylinder", rarity = "Epic"},
+            {name = "Armored Slab", rarity = "Epic"},
+            {name = "Armored Wedge", rarity = "Epic"},
+            {name = "Double Wing", rarity = "Legend"}
+        }
+    },
+}
+
+-- Rarity colors for item chips (mapped to match game rarity names including "Legend")
+local chipRarityColors = {
+    Common   = Color3.fromRGB(140, 140, 140),
+    Uncommon = Color3.fromRGB(60, 180, 100),
+    Rare     = Color3.fromRGB(50, 130, 235),
+    Epic     = Color3.fromRGB(155, 60, 220),
+    Legend   = Color3.fromRGB(235, 155, 0),
+    Legendary= Color3.fromRGB(235, 155, 0),
+    Mythic   = Color3.fromRGB(235, 40, 75),
+    Mythical = Color3.fromRGB(235, 40, 75),
+    Secret   = Color3.fromRGB(41, 41, 34),
+    Divine   = Color3.fromRGB(240, 215, 80),
+}
+
+-- Blacklist count indicator
+local blCountLabel = Instance.new("TextLabel")
+blCountLabel.Size = UDim2.new(1, 0, 0, 20)
+blCountLabel.BackgroundTransparency = 1
+blCountLabel.TextColor3 = C.textDim
+blCountLabel.Font = Enum.Font.Gotham
+blCountLabel.TextSize = 11
+blCountLabel.TextXAlignment = Enum.TextXAlignment.Left
+blCountLabel.Parent = rollBuyPage
+
+local function updateBlacklistCount()
+    local count = 0
+    for _, active in pairs(selectedBlacklistItems) do
+        if active then count = count + 1 end
+    end
+    blCountLabel.Text = "Blacklisted: " .. tostring(count) .. " item(s) — click items below to toggle"
+    blCountLabel.TextColor3 = count > 0 and C.red or C.textDim
+end
+updateBlacklistCount()
+
+-- Store all chip buttons for reset functionality
+local allBlacklistChips = {}
+
+-- Build the category grid
+for catIdx, catData in ipairs(ITEM_DATABASE) do
+    -- Category header card
+    local catHeader = Instance.new("Frame")
+    catHeader.Size = UDim2.new(1, 0, 0, 28)
+    catHeader.BackgroundColor3 = C.sidebar
+    catHeader.BorderSizePixel = 0
+    catHeader.LayoutOrder = 100 + catIdx * 10
+    catHeader.Parent = rollBuyPage
+    safeCorner(catHeader, 4)
+
+    local catLabel = Instance.new("TextLabel")
+    catLabel.Size = UDim2.new(1, -12, 1, 0)
+    catLabel.Position = UDim2.new(0, 8, 0, 0)
+    catLabel.BackgroundTransparency = 1
+    catLabel.Text = catData.category
+    catLabel.TextColor3 = C.accentLt
+    catLabel.Font = Enum.Font.GothamBold
+    catLabel.TextSize = 11
+    catLabel.TextXAlignment = Enum.TextXAlignment.Left
+    catLabel.Parent = catHeader
+
+    -- Items container with wrapping grid
+    local itemsContainer = Instance.new("Frame")
+    itemsContainer.Size = UDim2.new(1, 0, 0, 0) -- auto-sized
+    itemsContainer.BackgroundColor3 = C.card
+    itemsContainer.BorderSizePixel = 0
+    itemsContainer.AutomaticSize = Enum.AutomaticSize.Y
+    itemsContainer.LayoutOrder = 100 + catIdx * 10 + 1
+    itemsContainer.Parent = rollBuyPage
+    safeCorner(itemsContainer, 5)
+    safeStroke(itemsContainer, C.border, 1, 0.5)
+
+    local itemsPad = Instance.new("UIPadding")
+    itemsPad.PaddingLeft = UDim.new(0, 8)
+    itemsPad.PaddingRight = UDim.new(0, 8)
+    itemsPad.PaddingTop = UDim.new(0, 8)
+    itemsPad.PaddingBottom = UDim.new(0, 8)
+    itemsPad.Parent = itemsContainer
+
+    -- Use a wrapping layout for chips
+    local itemsLayout = Instance.new("UIListLayout")
+    itemsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    itemsLayout.Padding = UDim.new(0, 6)
+    itemsLayout.FillDirection = Enum.FillDirection.Horizontal
+    itemsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+    itemsLayout.Wraps = true
+    itemsLayout.Parent = itemsContainer
+
+    for itemIdx, itemData in ipairs(catData.items) do
+        local itemKey = string.lower(itemData.name)
+        local rarCol = chipRarityColors[itemData.rarity] or C.textDim
+        local isBlocked = selectedBlacklistItems[itemKey] == true
+
+        local chip = Instance.new("TextButton")
+        chip.Size = UDim2.new(0, 0, 0, 28)
+        chip.AutomaticSize = Enum.AutomaticSize.X
+        chip.BackgroundColor3 = isBlocked and Color3.fromRGB(50, 20, 25) or C.sidebar
+        chip.BorderSizePixel = 0
+        chip.Text = ""
+        chip.LayoutOrder = itemIdx
+        chip.Parent = itemsContainer
+        safeCorner(chip, 6)
+        safeStroke(chip, isBlocked and C.red or rarCol, 1, isBlocked and 0.2 or 0.5)
+
+        local chipPad = Instance.new("UIPadding")
+        chipPad.PaddingLeft = UDim.new(0, 10)
+        chipPad.PaddingRight = UDim.new(0, 10)
+        chipPad.Parent = chip
+
+        -- Rarity dot indicator
+        local rarDot = Instance.new("Frame")
+        rarDot.Size = UDim2.new(0, 8, 0, 8)
+        rarDot.Position = UDim2.new(0, 0, 0.5, -4)
+        rarDot.BackgroundColor3 = rarCol
+        rarDot.BorderSizePixel = 0
+        rarDot.Parent = chip
+        safeCorner(rarDot, 4)
+
+        -- Item name label
+        local chipLabel = Instance.new("TextLabel")
+        chipLabel.Size = UDim2.new(0, 0, 1, 0)
+        chipLabel.Position = UDim2.new(0, 14, 0, 0)
+        chipLabel.AutomaticSize = Enum.AutomaticSize.X
+        chipLabel.BackgroundTransparency = 1
+        chipLabel.Text = itemData.name
+        chipLabel.TextColor3 = isBlocked and Color3.fromRGB(180, 80, 80) or C.textMain
+        chipLabel.Font = Enum.Font.GothamMedium
+        chipLabel.TextSize = 11
+        chipLabel.Parent = chip
+
+        -- Strikethrough line (visible when blacklisted)
+        local strikeLine = Instance.new("Frame")
+        strikeLine.Size = UDim2.new(1, 4, 0, 1)
+        strikeLine.Position = UDim2.new(0, -2, 0.5, 0)
+        strikeLine.BackgroundColor3 = C.red
+        strikeLine.BorderSizePixel = 0
+        strikeLine.Visible = isBlocked
+        strikeLine.Parent = chipLabel
+
+        -- Blocked X icon
+        local blockedIcon = Instance.new("TextLabel")
+        blockedIcon.Size = UDim2.new(0, 14, 1, 0)
+        blockedIcon.Position = UDim2.new(1, 2, 0, 0)
+        blockedIcon.BackgroundTransparency = 1
+        blockedIcon.Text = isBlocked and "✕" or ""
+        blockedIcon.TextColor3 = C.red
+        blockedIcon.Font = Enum.Font.GothamBold
+        blockedIcon.TextSize = 10
+        blockedIcon.Parent = chipLabel
+
+        local function updateChipVisual(blocked)
+            if blocked then
+                chip.BackgroundColor3 = Color3.fromRGB(50, 20, 25)
+                chipLabel.TextColor3 = Color3.fromRGB(180, 80, 80)
+                strikeLine.Visible = true
+                blockedIcon.Text = "✕"
+                -- Update stroke
+                for _, child in ipairs(chip:GetChildren()) do
+                    if child:IsA("UIStroke") then
+                        child.Color = C.red
+                        child.Transparency = 0.2
+                    end
+                end
+            else
+                chip.BackgroundColor3 = C.sidebar
+                chipLabel.TextColor3 = C.textMain
+                strikeLine.Visible = false
+                blockedIcon.Text = ""
+                for _, child in ipairs(chip:GetChildren()) do
+                    if child:IsA("UIStroke") then
+                        child.Color = rarCol
+                        child.Transparency = 0.5
+                    end
+                end
+            end
+        end
+
+        chip.MouseButton1Click:Connect(function()
+            local newState = not (selectedBlacklistItems[itemKey] == true)
+            selectedBlacklistItems[itemKey] = newState or nil
+            updateChipVisual(newState)
+            updateBlacklistCount()
+
+            -- Rebuild blacklistText for config compatibility
+            local parts = {}
+            for k, v in pairs(selectedBlacklistItems) do
+                if v then table.insert(parts, k) end
+            end
+            blacklistText = table.concat(parts, ", ")
+
+            saveConfig()
+            if newState then
+                notify("BLACKLISTED: " .. itemData.name .. " (" .. itemData.rarity .. ")", true)
+            else
+                notify("UNBLOCKED: " .. itemData.name .. " (" .. itemData.rarity .. ")", false)
+            end
+        end)
+
+        -- Hover effect
+        chip.MouseEnter:Connect(function()
+            if not (selectedBlacklistItems[itemKey] == true) then
+                safeTween(chip, TweenInfo and TweenInfo.new(0.15) or nil, {BackgroundColor3 = C.cardHover})
+            end
+        end)
+        chip.MouseLeave:Connect(function()
+            local blocked = selectedBlacklistItems[itemKey] == true
+            safeTween(chip, TweenInfo and TweenInfo.new(0.15) or nil, {
+                BackgroundColor3 = blocked and Color3.fromRGB(50, 20, 25) or C.sidebar
+            })
+        end)
+
+        table.insert(allBlacklistChips, {
+            key = itemKey,
+            updateVisual = updateChipVisual,
+            data = itemData,
+        })
+    end
+end
+
+-- Quick action buttons row
+local blActionsFrame = Instance.new("Frame")
+blActionsFrame.Size = UDim2.new(1, 0, 0, 32)
+blActionsFrame.BackgroundTransparency = 1
+blActionsFrame.Parent = rollBuyPage
+
+local blActionsLayout = Instance.new("UIListLayout")
+blActionsLayout.FillDirection = Enum.FillDirection.Horizontal
+blActionsLayout.Padding = UDim.new(0, 8)
+blActionsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+blActionsLayout.Parent = blActionsFrame
+
+-- "Clear All" button
+local clearAllBtn = Instance.new("TextButton")
+clearAllBtn.Size = UDim2.new(0, 130, 0, 28)
+clearAllBtn.BackgroundColor3 = C.sidebar
+clearAllBtn.TextColor3 = C.green
+clearAllBtn.Font = Enum.Font.GothamBold
+clearAllBtn.TextSize = 11
+clearAllBtn.Text = "✓  UNBLOCK ALL"
+clearAllBtn.BorderSizePixel = 0
+clearAllBtn.Parent = blActionsFrame
+safeCorner(clearAllBtn, 5)
+safeStroke(clearAllBtn, C.green, 1, 0.5)
+
+clearAllBtn.MouseButton1Click:Connect(function()
+    selectedBlacklistItems = {}
+    blacklistText = ""
+    for _, chipInfo in ipairs(allBlacklistChips) do
+        chipInfo.updateVisual(false)
+    end
+    updateBlacklistCount()
+    saveConfig()
+    notify("All items unblocked from blacklist", false)
+end)
+
+-- "Block Common/Uncommon" quick preset
+local blockLowBtn = Instance.new("TextButton")
+blockLowBtn.Size = UDim2.new(0, 180, 0, 28)
+blockLowBtn.BackgroundColor3 = C.sidebar
+blockLowBtn.TextColor3 = C.orange
+blockLowBtn.Font = Enum.Font.GothamBold
+blockLowBtn.TextSize = 11
+blockLowBtn.Text = "🚫  BLOCK COMMON+UNCOMMON"
+blockLowBtn.BorderSizePixel = 0
+blockLowBtn.Parent = blActionsFrame
+safeCorner(blockLowBtn, 5)
+safeStroke(blockLowBtn, C.orange, 1, 0.5)
+
+blockLowBtn.MouseButton1Click:Connect(function()
+    local lowRarities = {Common = true, Uncommon = true}
+    for _, chipInfo in ipairs(allBlacklistChips) do
+        if lowRarities[chipInfo.data.rarity] then
+            selectedBlacklistItems[chipInfo.key] = true
+            chipInfo.updateVisual(true)
+        end
+    end
+    local parts = {}
+    for k, v in pairs(selectedBlacklistItems) do
+        if v then table.insert(parts, k) end
+    end
+    blacklistText = table.concat(parts, ", ")
+    updateBlacklistCount()
+    saveConfig()
+    notify("Blocked all Common & Uncommon items", true)
+end)
+
+-- ===================== TAB 4: EVENT BOSS PAGE =====================
+addSectionHeader(bossPage, "Event Boss Control")
+
+bossMainToggle = addToggleRow(bossPage, "Enable Event Boss Auto Join & Orbit", bossOn, function(s)
+    bossOn = s
+    if ovBoss then ovBoss.setState(s) end
+    notify("Event Boss Engine: " .. (s and "ON" or "OFF"), false)
+end)
+
+addSectionHeader(bossPage, "Event Boss Information")
+
+local bossInfoCard = Instance.new("Frame")
+bossInfoCard.Size = UDim2.new(1, 0, 0, 95)
+bossInfoCard.BackgroundColor3 = C.card
+bossInfoCard.BorderSizePixel = 0
+bossInfoCard.Parent = bossPage
+safeCorner(bossInfoCard, 5)
+safeStroke(bossInfoCard, C.border, 1, 0.4)
+
+local bossIconLbl = Instance.new("TextLabel")
+bossIconLbl.Size = UDim2.new(0, 36, 0, 36)
+bossIconLbl.Position = UDim2.new(0, 12, 0, 12)
+bossIconLbl.BackgroundTransparency = 1
+bossIconLbl.Text = "👾"
+bossIconLbl.TextSize = 24
+bossIconLbl.Parent = bossInfoCard
+
+local bossTitle = Instance.new("TextLabel")
+bossTitle.Size = UDim2.new(1, -60, 0, 20)
+bossTitle.Position = UDim2.new(0, 52, 0, 12)
+bossTitle.BackgroundTransparency = 1
+bossTitle.Text = "DEDICATED EVENT BOSS ENGINE"
+bossTitle.TextColor3 = C.accentLt
+bossTitle.Font = Enum.Font.GothamBold
+bossTitle.TextSize = 12
+bossTitle.TextXAlignment = Enum.TextXAlignment.Left
+bossTitle.Parent = bossInfoCard
+
+local bossDesc = Instance.new("TextLabel")
+bossDesc.Size = UDim2.new(1, -24, 0, 48)
+bossDesc.Position = UDim2.new(0, 12, 0, 38)
+bossDesc.BackgroundTransparency = 1
+bossDesc.Text = "Monitors screen popups for boss enter prompts ('Enter' buttons) and fires them automatically. Once in boss arena, continuously orbits target 35 studs overhead with zero collision."
+bossDesc.TextColor3 = C.textDim
+bossDesc.Font = Enum.Font.Gotham
+bossDesc.TextSize = 11
+bossDesc.TextWrapped = true
+bossDesc.TextXAlignment = Enum.TextXAlignment.Left
+bossDesc.Parent = bossInfoCard
+
+-- ===================== TAB 5: MONEY FARM PAGE =====================
+addSectionHeader(moneyPage, "Money Farm Control")
+
+moneyFarmMainToggle = addToggleRow(moneyPage, "Enable Auto Drive for this to work (Drives to Stage 5)", moneyFarmOn, function(s)
+    moneyFarmOn = s
+    if not s then
+        moneyFarmArrived = false
+    end
+    if ovMoneyFarm then ovMoneyFarm.setState(s) end
+    notify("Money Farm: " .. (s and "ON — Driving to Stage 5 (Batch_58)" or "OFF — Returning to Lobby"), false)
+end)
+
+addSectionHeader(moneyPage, "Money Farm Information")
+
+local mfInfoCard = Instance.new("Frame")
+mfInfoCard.Size = UDim2.new(1, 0, 0, 95)
+mfInfoCard.BackgroundColor3 = C.card
+mfInfoCard.BorderSizePixel = 0
+mfInfoCard.Parent = moneyPage
+safeCorner(mfInfoCard, 5)
+safeStroke(mfInfoCard, C.border, 1, 0.4)
+
+local mfIconLbl = Instance.new("TextLabel")
+mfIconLbl.Size = UDim2.new(0, 36, 0, 36)
+mfIconLbl.Position = UDim2.new(0, 12, 0, 12)
+mfIconLbl.BackgroundTransparency = 1
+mfIconLbl.Text = "💰"
+mfIconLbl.TextSize = 24
+mfIconLbl.Parent = mfInfoCard
+
+local mfTitle = Instance.new("TextLabel")
+mfTitle.Size = UDim2.new(1, -60, 0, 20)
+mfTitle.Position = UDim2.new(0, 52, 0, 12)
+mfTitle.BackgroundTransparency = 1
+mfTitle.Text = "MONEY FARM ENGINE"
+mfTitle.TextColor3 = C.accentLt
+mfTitle.Font = Enum.Font.GothamBold
+mfTitle.TextSize = 12
+mfTitle.TextXAlignment = Enum.TextXAlignment.Left
+mfTitle.Parent = mfInfoCard
+
+local mfDesc = Instance.new("TextLabel")
+mfDesc.Size = UDim2.new(1, -24, 0, 48)
+mfDesc.Position = UDim2.new(0, 12, 0, 38)
+mfDesc.BackgroundTransparency = 1
+mfDesc.Text = "Enable Auto Drive for this to work, This freezes your car to passively earn money."
+mfDesc.TextColor3 = C.textDim
+mfDesc.Font = Enum.Font.Gotham
+mfDesc.TextSize = 11
+mfDesc.TextWrapped = true
+mfDesc.TextXAlignment = Enum.TextXAlignment.Left
+mfDesc.Parent = mfInfoCard
+
+-- ===================== TAB 6: SETTINGS PAGE =====================
+addSectionHeader(settingsPage, "GUI Visibility & Keybinds")
+
+local keybindBtn = Instance.new("TextButton")
+keybindBtn.Size = UDim2.new(1, 0, 0, 40)
+keybindBtn.BackgroundColor3 = C.card
+keybindBtn.TextColor3 = C.textMain
+keybindBtn.Font = Enum.Font.GothamBold
+keybindBtn.TextSize = 13
+keybindBtn.Text = "MINIMIZE KEYBIND:  [ " .. minimizeKeybind.Name .. " ]"
+keybindBtn.BorderSizePixel = 0
+keybindBtn.Parent = settingsPage
+safeCorner(keybindBtn, 5)
+safeStroke(keybindBtn, C.border, 1, 0.4)
+
+keybindBtn.MouseButton1Click:Connect(function()
+    listeningForKey = true
+    keybindBtn.Text = "PRESS ANY KEY NOW (ESC TO CANCEL)..."
+    keybindBtn.TextColor3 = C.orange
+end)
+
+local toggleGuiBtn = Instance.new("TextButton")
+toggleGuiBtn.Size = UDim2.new(1, 0, 0, 36)
+toggleGuiBtn.BackgroundColor3 = C.sidebar
+toggleGuiBtn.TextColor3 = C.accentLt
+toggleGuiBtn.Font = Enum.Font.GothamBold
+toggleGuiBtn.TextSize = 12
+toggleGuiBtn.Text = "MINIMIZE TO FLOATING ICON NOW"
+toggleGuiBtn.BorderSizePixel = 0
+toggleGuiBtn.Parent = settingsPage
+safeCorner(toggleGuiBtn, 5)
+safeStroke(toggleGuiBtn, C.accent, 1, 0.4)
+
+local isMinimized = false
+local function toggleMinimize()
+    isMinimized = not isMinimized
+    if isMinimized then
+        main.Visible = false
+        minWidget.Visible = true
+        notify("GUI Minimized to Draggable Icon", false)
+    else
+        main.Visible = true
+        minWidget.Visible = false
+    end
+end
+
+toggleGuiBtn.MouseButton1Click:Connect(toggleMinimize)
+minBtn.MouseButton1Click:Connect(toggleMinimize)
+minWidgetClicker.MouseButton1Click:Connect(toggleMinimize)
+
+addSectionHeader(settingsPage, "Configuration Management")
+
+local resetConfigBtn = Instance.new("TextButton")
+resetConfigBtn.Size = UDim2.new(1, 0, 0, 36)
+resetConfigBtn.BackgroundColor3 = Color3.fromRGB(45, 25, 30)
+resetConfigBtn.TextColor3 = C.red
+resetConfigBtn.Font = Enum.Font.GothamBold
+resetConfigBtn.TextSize = 12
+resetConfigBtn.Text = "RESET CONFIGURATIONS TO DEFAULTS"
+resetConfigBtn.BorderSizePixel = 0
+resetConfigBtn.Parent = settingsPage
+safeCorner(resetConfigBtn, 5)
+safeStroke(resetConfigBtn, C.red, 1, 0.5)
+
+resetConfigBtn.MouseButton1Click:Connect(function()
+    pcall(function()
+        if delfile and isfile and isfile(CONFIG_FILE) then
+            delfile(CONFIG_FILE)
+        end
+    end)
+    driveOn, noclipOn, rollBuyOn, rollOn, autoBuyOn, bossOn, moneyFarmOn = false, false, false, false, false, false, false
+    moneyFarmArrived = false
+    customSpeed = 100
+    minRarityIdx = 3
+    useBlacklist = false
+    blacklistText = ""
+    selectedBlacklistItems = {}
+    minimizeKeybind = Enum.KeyCode.RightControl
+
+    ovDrive.setState(false); driveMainToggle.setState(false)
+    ovNoclip.setState(false); noclipMainToggle.setState(false)
+    ovRollBuy.setState(false); rollBuyMainToggle.setState(false)
+    ovBoss.setState(false); bossMainToggle.setState(false)
+    ovMoneyFarm.setState(false); moneyFarmMainToggle.setState(false)
+    updateSpeedUI(100)
+    rarityBtn.Text = "MINIMUM RARITY:  " .. rarityNames[minRarityIdx] .. "+"
+    blBox.Text = ""
+    blToggle.setState(false)
+    keybindBtn.Text = "MINIMIZE KEYBIND:  [ " .. minimizeKeybind.Name .. " ]"
+
+    saveConfig()
+    notify("Configurations reset to defaults!", true)
+end)
+
+addSectionHeader(settingsPage, "Script Information")
+
+local infoCard = Instance.new("Frame")
+infoCard.Size = UDim2.new(1, 0, 0, 80)
+infoCard.BackgroundColor3 = C.card
+infoCard.BorderSizePixel = 0
+infoCard.Parent = settingsPage
+safeCorner(infoCard, 5)
+safeStroke(infoCard, C.border, 1, 0.4)
+
+local infoLbl = Instance.new("TextLabel")
+infoLbl.Size = UDim2.new(1, -24, 1, -16)
+infoLbl.Position = UDim2.new(0, 12, 0, 8)
+infoLbl.BackgroundTransparency = 1
+infoLbl.Text = "DEV G SCRIPTS v2.7\n• Auto-Save Configs: ACTIVE (dev_g_config.json)\n• Auto Drive: Linked with Noclip Engine\n• Anti-AFK Engine: ACTIVE (Always On)"
+infoLbl.TextColor3 = C.textDim
+infoLbl.Font = Enum.Font.Gotham
+infoLbl.TextSize = 11
+infoLbl.TextXAlignment = Enum.TextXAlignment.Left
+infoLbl.TextYAlignment = Enum.TextYAlignment.Top
+infoLbl.Parent = infoCard
+
+-- ===================== TAB 6: CONSOLE LOG PAGE =====================
+addSectionHeader(logPage, "Purchased Items History")
+
+local consoleFrame = Instance.new("ScrollingFrame")
+consoleFrame.Size = UDim2.new(1, 0, 0, 230)
+consoleFrame.BackgroundColor3 = Color3.fromRGB(8, 9, 12)
+consoleFrame.BorderSizePixel = 0
+consoleFrame.ScrollBarThickness = 4
+consoleFrame.ScrollBarImageColor3 = C.border
+consoleFrame.Parent = logPage
+safeCorner(consoleFrame, 5)
+safeStroke(consoleFrame, C.border, 1, 0.5)
+
+local consoleLayout = Instance.new("UIListLayout")
+consoleLayout.SortOrder = Enum.SortOrder.LayoutOrder
+consoleLayout.Padding = UDim.new(0, 3)
+consoleLayout.Parent = consoleFrame
+
+updateConsoleUI = function()
+    if not consoleFrame or not consoleFrame.Parent then return end
+    pcall(function()
+        for _, child in ipairs(consoleFrame:GetChildren()) do
+            if child:IsA("TextLabel") then child:Destroy() end
+        end
+        if #logs == 0 then
+            local emptyLabel = Instance.new("TextLabel")
+            emptyLabel.Size = UDim2.new(1, -12, 0, 24)
+            emptyLabel.Position = UDim2.new(0, 6, 0, 6)
+            emptyLabel.BackgroundTransparency = 1
+            emptyLabel.Text = "No items bought yet. Auto Buy purchases will appear here..."
+            emptyLabel.TextColor3 = C.textOff
+            emptyLabel.Font = Enum.Font.Gotham
+            emptyLabel.TextSize = 11
+            emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+            emptyLabel.Parent = consoleFrame
+        else
+            for idx, entry in ipairs(logs) do
+                local line = Instance.new("TextLabel")
+                line.Size = UDim2.new(1, -12, 0, 16)
+                line.Position = UDim2.new(0, 6, 0, 0)
+                line.BackgroundTransparency = 1
+                line.Text = entry
+                line.TextColor3 = C.green
+                line.Font = Enum.Font.Code
+                line.TextSize = 11
+                line.TextXAlignment = Enum.TextXAlignment.Left
+                line.LayoutOrder = idx
+                line.Parent = consoleFrame
+            end
+        end
+        consoleFrame.CanvasPosition = Vector2.new(0, consoleLayout.AbsoluteContentSize.Y)
+    end)
+end
+
+updateConsoleUI()
+
+-- ===================== CLOSE SCRIPT HANDLER =====================
+local function destroyScript()
+    driveOn, noclipOn, rollBuyOn, rollOn, autoBuyOn, bossOn, moneyFarmOn = false, false, false, false, false, false, false
+    moneyFarmArrived = false
+    straightDir = nil
+    for _, conn in ipairs(connections) do
+        if conn and conn.Connected then pcall(function() conn:Disconnect() end) end
+    end
+    table.clear(connections)
+    pcall(function() gui:Destroy() end)
+    _G.DEVG_DESTROY = nil
+    print("[DEV G] Script unloaded successfully.")
+end
+
+_G.DEVG_DESTROY = destroyScript
+closeBtn.MouseButton1Click:Connect(destroyScript)
+unloadBtn.MouseButton1Click:Connect(destroyScript)
+
+-- ===================== KEYBIND & INPUT LISTENER =====================
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gpe)
+    if listeningForKey then
+        if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
+            if input.KeyCode == Enum.KeyCode.Escape then
+                listeningForKey = false
+                keybindBtn.Text = "MINIMIZE KEYBIND:  [ " .. minimizeKeybind.Name .. " ]"
+                keybindBtn.TextColor3 = C.textMain
+                notify("Keybind configuration cancelled.", true)
+                return
+            end
+            minimizeKeybind = input.KeyCode
+            listeningForKey = false
+            keybindBtn.Text = "MINIMIZE KEYBIND:  [ " .. minimizeKeybind.Name .. " ]"
+            keybindBtn.TextColor3 = C.accentLt
+            notify("Minimize keybind set to: " .. minimizeKeybind.Name, false)
+            saveConfig()
+            return
+        end
+    end
+
+    if gpe then return end
+    pcall(function()
+        if input.KeyCode == minimizeKeybind then
+            toggleMinimize()
+            return
+        end
+    end)
+end))
+
+-- Sync state indicators & UI labels
+table.insert(connections, RunService.Heartbeat:Connect(function()
+    pcall(function()
+        if lp then
+            local cv = lp:FindFirstChild("CashValue")
+            statCash.Text = cv and tostring(cv.Value) or "N/A"
+        end
+        statRolls.Text = tostring(rollN)
+        statBuys.Text = tostring(buyN)
+        footerStatus.Text = string.format("STATUS: Drive %s | Roll&Buy %s | Boss %s",
+            driveOn and "ON" or "OFF",
+            rollBuyOn and "ON" or "OFF",
+            bossOn and "ACTIVE" or "OFF")
+    end)
+end))
+
+-- ===================== ENGINE: AUTO-BUY (FAIL-PROOF PROMPT TRIGGERING) =====================
+local lastBuyStandState = {}
+
+local function firePromptSafe(prompt)
+    if not prompt or not prompt.Parent then return false end
+
+    pcall(function()
+        prompt.MaxActivationDistance = math.huge
+        prompt.RequiresLineOfSight = false
+        prompt.Enabled = true
+    end)
+
+    local success = false
+
+    if fireproximityprompt then
+        pcall(function()
+            fireproximityprompt(prompt)
+            success = true
+        end)
+    end
+
+    pcall(function()
+        local hrp = lp and lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        local promptPart = prompt.Parent
+        local targetCFrame = nil
+
+        if promptPart:IsA("BasePart") then
+            targetCFrame = promptPart.CFrame
+        elseif promptPart:IsA("Attachment") then
+            targetCFrame = promptPart.WorldCFrame
+        end
+
+        if hrp and targetCFrame then
+            hrp.CFrame = targetCFrame
+            task.wait(0.08)
+        end
+
+        prompt:InputHoldBegin()
+        task.wait(0.2)
+        prompt:InputHoldEnd()
+        success = true
+    end)
+
+    return success
+end
+
+task.spawn(function()
+    while gui and gui.Parent do
+        task.wait(0.2)
+        if not autoBuyOn then
+            lastBuyStandState = {}
+        else
+            pcall(function()
+                local plot = myPlot()
+                local rolls = plot and plot:FindFirstChild("Rolls")
+                if rolls then
+                    for _, standName in ipairs({"RollWeapons", "RollBlocks"}) do
+                        local stand = rolls:FindFirstChild(standName)
+                        if stand then
+                            local buyPrompt = nil
+                            for _, desc in ipairs(stand:GetDescendants()) do
+                                if desc:IsA("ProximityPrompt") then
+                                    local action = string.lower(desc.ActionText or "")
+                                    local name = string.lower(desc.Name)
+                                    if string.find(action, "buy") or string.find(name, "buy") or string.find(action, "purchase") then
+                                        buyPrompt = desc
+                                        break
+                                    end
+                                end
+                            end
+                            if buyPrompt then
+                                local itemName = buyPrompt.ObjectText or ""
+                                if itemName ~= "" and itemName ~= "???" then
+                                    local stateKey = tostring(buyPrompt:GetDebugId(10)) .. "_" .. itemName
+                                    if lastBuyStandState[standName] ~= stateKey then
+                                        lastBuyStandState[standName] = stateKey
+                                        local rIdx, rName = nil, nil
+                                        pcall(function()
+                                            for _, desc in ipairs(stand:GetDescendants()) do
+                                                if desc:IsA("TextLabel") and desc.Text ~= "" and desc.Text ~= "???"
+                                                   and desc.Name ~= "Chance" and desc.Name ~= "Price" and desc.Name ~= "Count" then
+                                                    local txt = string.lower(desc.Text)
+                                                    for i, rn in ipairs(rarityNames) do
+                                                        if string.find(txt, string.lower(rn)) then
+                                                            rIdx, rName = i, rn
+                                                            break
+                                                        end
+                                                    end
+                                                    if rIdx then break end
+                                                end
+                                            end
+                                        end)
+                                        if not rIdx then rIdx, rName = detectRarityInItemPlace() end
+
+                                        -- Check Blacklist system first
+                                        local isBlacklisted = false
+                                        if useBlacklist then
+                                            local itemLow = string.lower(itemName)
+                                            for blWord, active in pairs(selectedBlacklistItems) do
+                                                if active and string.find(itemLow, blWord) then
+                                                    isBlacklisted = true
+                                                    break
+                                                end
+                                            end
+                                        end
+
+                                        -- Purchase Decision based on Rarity Filter and Blacklist
+                                        local shouldBuy = not isBlacklisted and (rIdx and rIdx >= minRarityIdx)
+
+                                        if shouldBuy then
+                                            _G.rollPauseUntil = tick() + 6.0
+
+                                            local hrp = lp and lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+                                            local oldCFrame = hrp and hrp.CFrame
+
+                                            local purchased = false
+                                            for attempt = 1, 3 do
+                                                if firePromptSafe(buyPrompt) then
+                                                    purchased = true
+                                                end
+                                                task.wait(0.2)
+                                            end
+
+                                            if hrp and oldCFrame then
+                                                task.wait(0.2)
+                                                hrp.CFrame = oldCFrame
+                                            end
+
+                                            buyN = buyN + 1
+                                            local logMsg = itemName .. " (" .. (rName or "Unknown") .. ")"
+                                            addLog(logMsg, "BOUGHT")
+                                            notify("BOUGHT: " .. logMsg, false)
+                                        else
+                                            notify("SKIP: " .. itemName .. " (" .. (rName or "?") .. ")", true)
+                                        end
+                                    end
+                                else
+                                    lastBuyStandState[standName] = nil
+                                end
+                            else
+                                lastBuyStandState[standName] = nil
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- ===================== ENGINE: NOCLIP =====================
+local function applyNoclip()
+    pcall(function()
+        local car = getCar()
+        if car then for _, p in ipairs(car:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide = false end end end
+        local ch = lp and lp.Character
+        if ch then for _, p in ipairs(ch:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide = false end end end
+    end)
+end
+
+-- ===================== ENGINE: IGNORE ZOMBIES =====================
+local function applyIgnoreZombies()
+    pcall(function()
+        local folder = workspace:FindFirstChild("Zombies") or workspace:FindFirstChild("Enemies") or workspace:FindFirstChild("NPCs")
+        if folder then
+            for _, z in ipairs(folder:GetChildren()) do
+                for _, p in ipairs(z:GetDescendants()) do
+                    if p:IsA("BasePart") then p.CanCollide = false; p.CanTouch = false end
+                end
+            end
+        end
+    end)
+end
+
+-- ===================== ENGINE: CAR RESPAWN =====================
+task.spawn(function()
+    while gui and gui.Parent do
+        task.wait(0.5)
+        if driveOn and not getCar() and tick() - lastRespawnTry > 12 then
+            lastRespawnTry = tick()
+            if Packets and Packets.SpawnCar then
+                pcall(function() Packets.SpawnCar:Fire() end)
+            end
+        end
+    end
+end)
+
+-- ===================== ENGINE: INFINITE TURBO =====================
+task.spawn(function()
+    while gui and gui.Parent do
+        task.wait(0.3)
+        if driveOn then
+            if Packets and Packets.SetTurbo then
+                pcall(function() Packets.SetTurbo:Fire(true) end)
+            end
+            local car = getCar()
+            if car then pcall(function() car:SetAttribute("NitroFuel", 1) end) end
+        end
+    end
+end)
+
+-- ===================== ENGINE: ROLL FARM =====================
+task.spawn(function()
+    while gui and gui.Parent do
+        task.wait(1.2)
+        local pauseUntil = _G.rollPauseUntil or 0
+        if rollOn and tick() > pauseUntil then
+            pcall(function()
+                local plot = myPlot()
+                local rolls = plot and plot:FindFirstChild("Rolls")
+                if rolls then
+                    for _, sn in ipairs({"RollBlocks", "RollWeapons"}) do
+                        if tick() <= (_G.rollPauseUntil or 0) then break end
+
+                        local st = rolls:FindFirstChild(sn)
+                        local rp = st and st:FindFirstChild("Roll")
+                        local pr = rp and rp:FindFirstChild("ProximityPrompt")
+                        if pr then
+                            pcall(function()
+                                pr.MaxActivationDistance = math.huge
+                                pr.RequiresLineOfSight = false
+                                pr.Enabled = true
+                                if fireproximityprompt then
+                                    fireproximityprompt(pr)
+                                else
+                                    pr:InputHoldBegin()
+                                    task.wait(0.1)
+                                    pr:InputHoldEnd()
+                                end
+                            end)
+                            rollN = rollN + 1
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- ===================== ENGINE: AUTO-BOSS JOINER =====================
+local function triggerButton(btn)
+    pcall(function()
+        if firesignal then
+            pcall(function() firesignal(btn.MouseButton1Click) end)
+            pcall(function() firesignal(btn.MouseButton1Down) end)
+            pcall(function() firesignal(btn.Activated) end)
+        end
+        if getconnections then
+            pcall(function()
+                for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do pcall(function() conn:Fire() end) end
+                for _, conn in ipairs(getconnections(btn.MouseButton1Down)) do pcall(function() conn:Fire() end) end
+                for _, conn in ipairs(getconnections(btn.Activated)) do pcall(function() conn:Fire() end) end
+            end)
+        end
+    end)
+end
+
+task.spawn(function()
+    while gui and gui.Parent do
+        task.wait(0.3)
+        if bossOn then
+            pcall(function()
+                if not lp then return end
+                local pGui = lp:FindFirstChild("PlayerGui")
+                if not pGui then return end
+
+                -- Path from Explorer screenshot: PlayerGui.MainGui.HUD.Boss.BossJoinAlert & BossAlert
+                local mainGui = pGui:FindFirstChild("MainGui")
+                local hud = mainGui and mainGui:FindFirstChild("HUD")
+                local bossHud = hud and hud:FindFirstChild("Boss")
+
+                if bossHud then
+                    local alerts = {bossHud:FindFirstChild("BossJoinAlert"), bossHud:FindFirstChild("BossAlert")}
+                    for _, alertFrame in ipairs(alerts) do
+                        if alertFrame and alertFrame.Visible then
+                            -- Check countdown / timer text labels inside alert frame
+                            local countdownText = nil
+                            for _, desc in ipairs(alertFrame:GetDescendants()) do
+                                if desc:IsA("TextLabel") and desc.Visible and desc.Text ~= "" then
+                                    local txt = desc.Text
+                                    if string.find(txt, ":") or string.find(string.lower(txt), "s") or string.find(string.lower(txt), "in") then
+                                        countdownText = txt
+                                    end
+                                end
+                            end
+
+                            -- Auto-fire enter/join button strictly inside alertFrame
+                            for _, desc in ipairs(alertFrame:GetDescendants()) do
+                                if (desc:IsA("TextButton") or desc:IsA("ImageButton")) and desc.Visible then
+                                    triggerButton(desc)
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- ===================== ENGINE: MAIN PHYSICS LOOP =====================
+table.insert(connections, RunService.PostSimulation:Connect(function(dt)
+    dt = dt or (1/60)
+
+    pcall(function()
+        if bossOn then
+            if not currentBoss or not currentBoss.Parent or (currentBoss:FindFirstChild("Humanoid") and currentBoss.Humanoid.Health <= 0) then
+                currentBoss = nil
+                bossAutoDisabledDrive = false -- reset flag when boss dies/despawns
+                
+                -- Broad search across ClientBosses, BossFightMap, and Workspace
+                local searchContainers = {
+                    workspace:FindFirstChild("ClientBosses"),
+                    workspace:FindFirstChild("Game") and workspace.Game:FindFirstChild("BossFightMap"),
+                    workspace:FindFirstChild("BossFightMap"),
+                    workspace
+                }
+
+                for _, container in ipairs(searchContainers) do
+                    if container then
+                        for _, obj in ipairs(container:GetDescendants()) do
+                            if obj:IsA("Model") and (obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("Torso") or obj.PrimaryPart) then
+                                if not Players:GetPlayerFromCharacter(obj) then
+                                    local name = string.lower(obj.Name)
+                                    local hum = obj:FindFirstChild("Humanoid")
+                                    if string.find(name, "hacker") or string.find(name, "zeus") or string.find(name, "boss") or string.find(name, "legenda") or (hum and hum.MaxHealth > 300) then
+                                        currentBoss = obj
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if currentBoss then break end
+                end
+            end
+
+            -- Auto-disable drive & noclip when boss is found (once per encounter)
+            if currentBoss and not bossAutoDisabledDrive then
+                bossAutoDisabledDrive = true
+                if driveOn or noclipOn then
+                    driveOn = false
+                    noclipOn = false
+                    straightDir = nil
+                    pcall(function()
+                        if ovDrive then ovDrive.setState(false) end
+                        if ovNoclip then ovNoclip.setState(false) end
+                        if driveMainToggle then driveMainToggle.setState(false) end
+                        if noclipMainToggle then noclipMainToggle.setState(false) end
+                    end)
+                    notify("Boss detected — Auto Drive & Noclip disabled", true)
+                    saveConfig()
+                end
+            end
+
+            -- Determine target root part or position in boss arena
+            local targetCFrame = nil
+            if currentBoss then
+                local root = currentBoss:FindFirstChild("HumanoidRootPart") or currentBoss.PrimaryPart or currentBoss:FindFirstChild("Torso")
+                if root then targetCFrame = root.CFrame end
+            end
+
+            -- Fallback: if in BossFightMap but model not found yet, use arena center position
+            if not targetCFrame then
+                local arena = (workspace:FindFirstChild("Game") and workspace.Game:FindFirstChild("BossFightMap")) or workspace:FindFirstChild("BossFightMap")
+                if arena then
+                    local centerPart = arena:FindFirstChild("Center") or arena:FindFirstChild("Spawn") or arena.PrimaryPart
+                    if centerPart then
+                        targetCFrame = centerPart.CFrame
+                    else
+                        -- Fallback to character position in arena
+                        for _, p in ipairs(arena:GetDescendants()) do
+                            if p:IsA("BasePart") then
+                                targetCFrame = p.CFrame
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+
+            if targetCFrame then
+                local bossPos = targetCFrame.Position
+                local car = getCar()
+                
+                applyNoclip()
+                applyIgnoreZombies()
+
+                orbitAngle = orbitAngle + (2.5 * dt)
+                local radius = 28
+                local offsetX = math.cos(orbitAngle) * radius
+                local offsetZ = math.sin(orbitAngle) * radius
+                local targetPos = bossPos + Vector3.new(offsetX, 0, offsetZ)
+
+                if car and car.PrimaryPart then
+                    local pp = car.PrimaryPart
+                    local tangentDir = Vector3.new(-math.sin(orbitAngle), 0, math.cos(orbitAngle)).Unit
+                    
+                    local rp = RaycastParams.new()
+                    rp.FilterType = Enum.RaycastFilterType.Exclude
+                    if lp and lp.Character then
+                        rp.FilterDescendantsInstances = {car, lp.Character}
+                    else
+                        rp.FilterDescendantsInstances = {car}
+                    end
+
+                    local gRay = workspace:Raycast(pp.Position + Vector3.new(0, 20, 0), Vector3.new(0, -50, 0), rp)
+                    local groundY = gRay and (gRay.Position.Y + 3.5) or bossPos.Y
+
+                    pp.AssemblyAngularVelocity = Vector3.zero
+                    pp.CFrame = CFrame.lookAt(Vector3.new(targetPos.X, groundY, targetPos.Z), Vector3.new(targetPos.X, groundY, targetPos.Z) + tangentDir)
+                    
+                    local SPEED = math.clamp(customSpeed, 80, 220)
+                    pp.AssemblyLinearVelocity = tangentDir * SPEED
+                    return
+                elseif lp and lp.Character and lp.Character:FindFirstChild("HumanoidRootPart") then
+                    local myRoot = lp.Character.HumanoidRootPart
+                    myRoot.CFrame = CFrame.lookAt(targetPos + Vector3.new(0, 5, 0), bossPos)
+                    myRoot.AssemblyLinearVelocity = Vector3.zero
+                    myRoot.AssemblyAngularVelocity = Vector3.zero
+                    return
+                end
+            end
+            -- No boss target found yet: fall through to normal drive/noclip logic below
+        else
+            currentBoss = nil
+            bossAutoDisabledDrive = false
+        end
+
+        -- ===== MONEY FARM ENGINE =====
+        if moneyFarmOn then
+            applyNoclip()
+            applyIgnoreZombies()
+
+            -- Find target position: workspace.Game.Stages.Stage_5.Geometry.Batch_58.Part
+            local targetPos = nil
+            pcall(function()
+                local stages = workspace:FindFirstChild("Game") and workspace.Game:FindFirstChild("Stages")
+                if not stages then return end
+
+                local function getPartCenter(inst)
+                    if not inst then return nil end
+                    if inst:IsA("BasePart") then
+                        return inst.Position
+                    elseif inst:IsA("Model") then
+                        if inst.PrimaryPart then
+                            return inst.PrimaryPart.Position
+                        else
+                            local cf, _ = inst:GetBoundingBox()
+                            return cf.Position
+                        end
+                    end
+                    return nil
+                end
+
+                -- Check Stage_5 specifically first
+                local stage5 = stages:FindFirstChild("Stage_5")
+                if stage5 then
+                    local geo = stage5:FindFirstChild("Geometry")
+                    if geo then
+                        local b = geo:FindFirstChild("Batch_58") or geo:FindFirstChild("Batch_57")
+                        if b then
+                            local p = b:FindFirstChild("Part")
+                            if p then
+                                targetPos = getPartCenter(p)
+                                return
+                            end
+                            targetPos = getPartCenter(b)
+                            return
+                        end
+                    end
+                end
+
+                -- Fallback check for Stage_5 in case of name format variation
+                for _, st in ipairs(stages:GetChildren()) do
+                    if st.Name == "Stage_5" or st.Name:find("5") then
+                        local geo = st:FindFirstChild("Geometry")
+                        if geo then
+                            local b = geo:FindFirstChild("Batch_58")
+                            if b then
+                                local p = b:FindFirstChild("Part")
+                                targetPos = getPartCenter(p or b)
+                                if targetPos then return end
+                            end
+                        end
+                    end
+                end
+            end)
+
+            if targetPos then
+                local car = getCar()
+                if car and car.PrimaryPart then
+                    local pp = car.PrimaryPart
+                    local dist = (Vector3.new(pp.Position.X, 0, pp.Position.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+
+                    if dist < 20 or moneyFarmArrived then
+                        -- Arrived — freeze car in the middle of Part
+                        moneyFarmArrived = true
+                        pp.AssemblyLinearVelocity = Vector3.zero
+                        pp.AssemblyAngularVelocity = Vector3.zero
+                        pp.CFrame = CFrame.new(targetPos.X, targetPos.Y + 2, targetPos.Z) * CFrame.Angles(0, pp.CFrame:ToEulerAnglesYXZ())
+                        return
+                    else
+                        -- Stage_5 target found: drive directly into the middle of Part
+                        local dir = (Vector3.new(targetPos.X, 0, targetPos.Z) - Vector3.new(pp.Position.X, 0, pp.Position.Z)).Unit
+                        local SPEED = math.clamp(customSpeed, 100, 300)
+                        pp.AssemblyAngularVelocity = Vector3.zero
+                        pp.CFrame = CFrame.lookAt(pp.Position, pp.Position + dir)
+
+                        local rp = RaycastParams.new()
+                        rp.FilterType = Enum.RaycastFilterType.Exclude
+                        if lp and lp.Character then
+                            rp.FilterDescendantsInstances = {car, lp.Character}
+                        else
+                            rp.FilterDescendantsInstances = {car}
+                        end
+                        local gRay = workspace:Raycast(pp.Position + Vector3.new(0, 30, 0), Vector3.new(0, -80, 0), rp)
+                        local groundY = gRay and (gRay.Position.Y + 2) or pp.Position.Y
+                        local yVel = math.clamp((groundY - pp.Position.Y) * 3, -40, 30)
+
+                        pp.AssemblyLinearVelocity = Vector3.new(dir.X * SPEED, yVel, dir.Z * SPEED)
+                        return
+                    end
+                end
+            else
+                -- Stage_5 has not streamed into workspace yet! Auto drive straight with noclip until it appears
+                local car = getCar()
+                if car and car.PrimaryPart then
+                    local pp = car.PrimaryPart
+                    local pos = pp.Position
+                    local SPEED = math.clamp(customSpeed, 100, 300)
+
+                    if not straightDir then
+                        local look = pp.CFrame.LookVector
+                        local hLook = Vector3.new(look.X, 0, look.Z)
+                        straightDir = hLook.Magnitude > 0.01 and hLook.Unit or Vector3.new(0, 0, -1)
+                    end
+
+                    pp.AssemblyAngularVelocity = Vector3.zero
+                    pp.CFrame = CFrame.lookAt(pos, pos + straightDir)
+
+                    local rp = RaycastParams.new()
+                    rp.FilterType = Enum.RaycastFilterType.Exclude
+                    if lp and lp.Character then
+                        rp.FilterDescendantsInstances = {car, lp.Character}
+                    else
+                        rp.FilterDescendantsInstances = {car}
+                    end
+
+                    local gRay = workspace:Raycast(pos + Vector3.new(0, 30, 0), Vector3.new(0, -80, 0), rp)
+                    local targetY = gRay and (gRay.Position.Y + 4) or pos.Y
+                    local yVel = math.clamp((targetY - pos.Y) * 3, -40, 30)
+
+                    pp.AssemblyLinearVelocity = Vector3.new(straightDir.X * SPEED, yVel, straightDir.Z * SPEED)
+                    return
+                end
+            end
+        end
+
+        applyIgnoreZombies()
+        if noclipOn then applyNoclip() end
+        if not driveOn then
+            straightDir = nil
+            return
+        end
+
+        local car = getCar()
+        if not car or not car.PrimaryPart then
+            straightDir = nil
+            return
+        end
+        local pp = car.PrimaryPart
+        local pos = pp.Position
+        local vel = pp.AssemblyLinearVelocity
+        local speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+        local SPEED = customSpeed
+
+        if not straightDir then
+            local look = pp.CFrame.LookVector
+            local hLook = Vector3.new(look.X, 0, look.Z)
+            straightDir = hLook.Magnitude > 0.01 and hLook.Unit or Vector3.new(0, 0, -1)
+        end
+
+        pp.AssemblyAngularVelocity = Vector3.zero
+        pp.CFrame = CFrame.lookAt(pos, pos + straightDir)
+
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        if lp and lp.Character then
+            rp.FilterDescendantsInstances = {car, lp.Character}
+        else
+            rp.FilterDescendantsInstances = {car}
+        end
+
+        local targetVelX = straightDir.X * SPEED
+        local targetVelZ = straightDir.Z * SPEED
+
+        local gRay = workspace:Raycast(pos + Vector3.new(0, 30, 0), Vector3.new(0, -80, 0), rp)
+        local targetY = gRay and (gRay.Position.Y + 4) or pos.Y
+        local yVel = math.clamp((targetY - pos.Y) * 3, -40, 30)
+
+        pp.AssemblyLinearVelocity = Vector3.new(targetVelX, yVel, targetVelZ)
+    end)
+end))
+
+notify("DEV G Loader GUI ready!", false)
+print("[DEV G] Auto Drive linked with Noclip Engine.")
